@@ -1,0 +1,5 @@
+{
+  "name": "project-kit",
+  "version": "1.0.0",
+  "description": "Loads the current multi-repo project and its knowledge base into every session"
+}

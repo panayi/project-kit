@@ -1,0 +1,13 @@
+{
+  "name": "project-kit",
+  "owner": {
+    "name": "project-kit"
+  },
+  "plugins": [
+    {
+      "name": "project-kit",
+      "source": "./plugin",
+      "description": "Loads the current multi-repo project and its knowledge base into every session"
+    }
+  ]
+}

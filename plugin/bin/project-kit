@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""project-kit: multi-repo projects, their Orca labels and knowledge bases."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE_DIR = ROOT / "kb-template"
+RULES_DIR = ROOT / "rules"
+CONFIG_HOME = Path(os.environ.get("PROJECT_KIT_HOME") or "~/.config/project-kit").expanduser()
+PROJECTS_DIR = CONFIG_HOME / "projects"
+EPIC_URL = re.compile(r"https://[^\s/]+/browse/([A-Z][A-Z0-9]*-\d+)")
+STATE_INLINE_LIMIT = 8000
+STATE_PREVIEW_LIMIT = 6000
+WORKTREE_COMMAND = re.compile(r"\bworktree\s+(add|create)\b")
+
+
+@dataclass(frozen=True)
+class Kb:
+    kind: str
+    path: Path
+    repo: str | None = None
+    branch: str | None = None
+
+    @property
+    def remote_url(self) -> str:
+        return f"https://github.com/{self.repo}.git"
+
+    def describe(self) -> str:
+        if self.kind == "branch":
+            return f"{self.path} (orphan branch `{self.branch}` of {self.repo})"
+        return f"{self.path} (local-only git repo)"
+
+
+@dataclass(frozen=True)
+class Project:
+    slug: str
+    name: str
+    icon: str
+    epics: tuple[str, ...]
+    kb: Kb | None
+
+    @property
+    def file(self) -> Path:
+        return PROJECTS_DIR / f"{self.slug}.json"
+
+    @property
+    def epic_keys(self) -> set[str]:
+        return {epic_key(url) for url in self.epics}
+
+
+def epic_key(url: str) -> str:
+    return url.rstrip("/").split("/")[-1]
+
+
+def parse_epic(value: str) -> str:
+    match = EPIC_URL.fullmatch(value.strip())
+    if match is None:
+        sys.exit(f"'{value}' is not a Jira epic link; pass the full link, e.g. https://<site>/browse/ABC-123")
+    return match.group(0)
+
+
+def parse_kb(raw: dict | None) -> Kb | None:
+    if raw is None:
+        return None
+    return Kb(
+        kind=raw["kind"],
+        path=Path(raw["path"]).expanduser(),
+        repo=raw.get("repo"),
+        branch=raw.get("branch"),
+    )
+
+
+def load_projects() -> list[Project]:
+    projects = []
+    if not PROJECTS_DIR.is_dir():
+        return []
+    for file in sorted(PROJECTS_DIR.glob("*.json")):
+        raw = json.loads(file.read_text())
+        projects.append(
+            Project(
+                slug=file.stem,
+                name=raw["name"],
+                icon=raw["icon"],
+                epics=tuple(raw.get("epics", [])),
+                kb=parse_kb(raw.get("kb")),
+            )
+        )
+    return projects
+
+
+def find_project(slug: str) -> Project:
+    for project in load_projects():
+        if project.slug == slug:
+            return project
+    sys.exit(f"no project with slug '{slug}'; run `project-kit list`")
+
+
+def run(args: list[str], cwd: Path | None = None, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def orca_worktree(cwd: Path) -> dict | None:
+    if shutil.which("orca") is None:
+        return None
+    try:
+        result = run(["orca", "reference", "list", "--worktree", "current", "--json"], cwd=cwd, timeout=10)
+        payload = json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    if not payload.get("ok"):
+        return None
+    return payload["result"]
+
+
+def jira_keys(orca: dict) -> set[str]:
+    return {
+        ref["jiraIdentifier"]
+        for ref in orca.get("references", [])
+        if ref.get("provider") == "jira" and ref.get("jiraIdentifier")
+    }
+
+
+def is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def detect(cwd: Path) -> tuple[Project, str] | None:
+    projects = load_projects()
+    orca = orca_worktree(cwd)
+    if orca:
+        keys = jira_keys(orca)
+        for project in projects:
+            if keys & project.epic_keys:
+                return project, f"Jira epic attached to the Orca worktree: {', '.join(sorted(keys & project.epic_keys))}"
+        display_name = orca.get("worktree", {}).get("displayName") or ""
+        for project in projects:
+            if project.icon in display_name:
+                return project, f"Orca worktree name: {display_name}"
+    for project in projects:
+        if project.kb and project.kb.path.exists() and is_inside(cwd, project.kb.path):
+            return project, f"cwd is inside the KB: {project.kb.path}"
+    return None
+
+
+def clone_kb(kb: Kb) -> str | None:
+    kb.path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = run(
+            ["git", "clone", "--single-branch", "--branch", kb.branch, kb.remote_url, str(kb.path)],
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return "clone timed out after 90s"
+    if result.returncode != 0:
+        return result.stderr.strip()
+    return None
+
+
+def pull_kb(kb: Kb) -> str:
+    if kb.kind != "branch":
+        return "local-only, nothing to pull"
+    if not kb.path.exists():
+        error = clone_kb(kb)
+        return f"clone failed: {error}" if error else "cloned fresh"
+    try:
+        result = run(["git", "pull", "--rebase"], cwd=kb.path, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "pull timed out after 30s; KB may be stale"
+    if result.returncode != 0:
+        return f"pull failed; KB may be stale: {result.stderr.strip()}"
+    return "pulled"
+
+
+def state_section(kb: Kb) -> str:
+    state_file = kb.path / "STATE.md"
+    if not state_file.exists():
+        return f"STATE.md is missing at {state_file}."
+    text = state_file.read_text()
+    if len(text) <= STATE_INLINE_LIMIT:
+        return f"## {state_file}\n\n{text}"
+    return (
+        f"## {state_file} (first {STATE_PREVIEW_LIMIT} of {len(text)} characters; read the whole file before working)\n\n"
+        + text[:STATE_PREVIEW_LIMIT].rsplit("\n", 1)[0]
+    )
+
+
+def epics_line(project: Project) -> str:
+    if not project.epics:
+        return "Epics: none"
+    return "Epics: " + ", ".join(f"{epic_key(url)} ({url})" for url in project.epics)
+
+
+def session_context(project: Project, reason: str) -> tuple[str, str | None]:
+    lines = [f"# Project: {project.icon} {project.name}", f"Detected from {reason}.", epics_line(project)]
+    if project.kb is None:
+        lines.append("This project has no knowledge base.")
+        return "\n".join(lines), None
+    status = pull_kb(project.kb)
+    finish = "push" if project.kb.kind == "branch" else "commit"
+    lines += [
+        f"KB: {project.kb.describe()}. Sync at session start: {status}.",
+        f"Follow {project.kb.path}/AGENTS.md. Before calling any task done, update STATE.md and {finish} the KB.",
+        "",
+        state_section(project.kb),
+    ]
+    return "\n".join(lines), status
+
+
+def hook_input() -> dict:
+    try:
+        return json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return {}
+
+
+def hook_cwd(payload: dict) -> Path:
+    return Path(payload.get("cwd") or os.getcwd())
+
+
+def rules_context() -> str:
+    return "\n\n".join(file.read_text().strip() for file in sorted(RULES_DIR.glob("*.md")))
+
+
+def cmd_session_start(_: argparse.Namespace) -> None:
+    payload = hook_input()
+    sections = [rules_context()]
+    output: dict = {}
+    match = detect(hook_cwd(payload))
+    if match is not None:
+        project, reason = match
+        project_context, sync = session_context(project, reason)
+        sections.append(project_context)
+        output["systemMessage"] = f"project-kit: {project.icon} {project.name}" + (f" · KB {sync}" if sync else " · no KB")
+    context = "\n\n".join(section for section in sections if section)
+    output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
+    print(json.dumps(output, ensure_ascii=False))
+
+
+def finish_command(kb: Kb) -> str:
+    command = f'git -C {kb.path} add -A && git -C {kb.path} commit -m "state: <one line>"'
+    return command + f" && git -C {kb.path} push" if kb.kind == "branch" else command
+
+
+def kb_dirty_reasons(kb: Kb) -> list[str]:
+    reasons = []
+    status = run(["git", "status", "--porcelain"], cwd=kb.path)
+    if status.stdout.strip():
+        reasons.append("uncommitted changes")
+    if kb.kind == "branch":
+        ahead = run(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=kb.path)
+        if ahead.returncode == 0 and ahead.stdout.strip() != "0":
+            reasons.append(f"{ahead.stdout.strip()} unpushed commit(s)")
+    return reasons
+
+
+def cmd_stop(_: argparse.Namespace) -> None:
+    payload = hook_input()
+    if payload.get("stop_hook_active"):
+        return
+    match = detect(hook_cwd(payload))
+    if match is None or match[0].kb is None or not match[0].kb.path.exists():
+        return
+    kb = match[0].kb
+    reasons = kb_dirty_reasons(kb)
+    if not reasons:
+        return
+    reason = (
+        f"The {match[0].name} KB at {kb.path} has {' and '.join(reasons)}. "
+        f"Update STATE.md if needed, then run `{finish_command(kb)}`. "
+        "If the user told you not to, say so and stop."
+    )
+    print(json.dumps({"decision": "block", "reason": reason}))
+
+
+def cmd_detect(args: argparse.Namespace) -> None:
+    match = detect(Path(args.path).expanduser().resolve())
+    if match is None:
+        print("no project matches")
+        return
+    project, reason = match
+    print(f"{project.icon} {project.name} ({project.slug}) via {reason}")
+
+
+def cmd_list(_: argparse.Namespace) -> None:
+    for project in load_projects():
+        epics = ", ".join(sorted(project.epic_keys)) or "no epics"
+        kb = project.kb.describe() if project.kb else "no KB"
+        print(f"{project.icon} {project.name}  [{project.slug}]  {epics}  KB: {kb}")
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def validate_new(name: str, icon: str, slug: str) -> None:
+    for project in load_projects():
+        if project.slug == slug:
+            sys.exit(f"project '{slug}' already exists")
+        if project.icon == icon:
+            sys.exit(f"icon {icon} is already used by {project.name}; pick one distinct in shape and colour")
+        if project.name.lower() == name.lower():
+            sys.exit(f"a project named '{project.name}' already exists")
+
+
+def render_template(project: Project, kb: Kb) -> None:
+    if kb.kind == "branch":
+        origin = (
+            f"This directory is the `{kb.branch}` **orphan branch** of `{kb.repo}`, cloned on its own. "
+            "Push directly to the branch: no PRs, no CI. Never merge it anywhere, branch off it, or open a PR from it."
+        )
+        push_note = "\n   If the push is rejected: `pull --rebase`, resolve (keep both sides' truths in STATE.md), push again."
+    else:
+        origin = "This directory is a local-only git repo on this machine. Nothing is pushed."
+        push_note = ""
+    epics = ", ".join(f"[{epic_key(url)}]({url})" for url in project.epics) or "none yet"
+    values = {
+        "{{name}}": project.name,
+        "{{icon}}": project.icon,
+        "{{epics}}": epics,
+        "{{kb_path}}": str(kb.path),
+        "{{kb_origin}}": origin,
+        "{{finish_command}}": finish_command(kb),
+        "{{push_note}}": push_note,
+        "{{today}}": subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip(),
+    }
+    for source in TEMPLATE_DIR.rglob("*"):
+        if source.is_dir():
+            continue
+        target = kb.path / source.relative_to(TEMPLATE_DIR)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = source.read_text()
+        for placeholder, value in values.items():
+            text = text.replace(placeholder, value)
+        target.write_text(text)
+    (kb.path / "CLAUDE.md").symlink_to("AGENTS.md")
+
+
+def git_or_die(args: list[str], cwd: Path) -> None:
+    result = run(["git", *args], cwd=cwd, timeout=120)
+    if result.returncode != 0:
+        sys.exit(f"git {' '.join(args)} failed in {cwd}:\n{result.stderr.strip()}")
+
+
+def create_kb(project: Project, kb: Kb) -> None:
+    if kb.path.exists() and any(kb.path.iterdir()):
+        sys.exit(f"{kb.path} exists and is not empty")
+    kb.path.mkdir(parents=True, exist_ok=True)
+    git_or_die(["init", "-q"], kb.path)
+    if kb.kind == "branch":
+        git_or_die(["remote", "add", "origin", kb.remote_url], kb.path)
+        git_or_die(["checkout", "-q", "--orphan", kb.branch], kb.path)
+    render_template(project, kb)
+    git_or_die(["add", "-A"], kb.path)
+    git_or_die(["commit", "-q", "-m", f"state: create {project.name} knowledge base"], kb.path)
+    if kb.kind == "branch":
+        git_or_die(["push", "-u", "origin", kb.branch], kb.path)
+
+
+def save_project(project: Project) -> None:
+    kb = None
+    if project.kb:
+        kb = {"kind": project.kb.kind, "path": str(project.kb.path).replace(str(Path.home()), "~", 1)}
+        if project.kb.kind == "branch":
+            kb.update(repo=project.kb.repo, branch=project.kb.branch)
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    raw = {"name": project.name, "icon": project.icon, "epics": list(project.epics), "kb": kb}
+    project.file.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
+
+
+def kb_from_args(args: argparse.Namespace) -> Kb | None:
+    if args.no_kb:
+        return None
+    if args.kb_local:
+        return Kb(kind="local", path=Path(args.kb_local).expanduser().resolve())
+    if args.kb_branch:
+        if not (args.branch and args.kb_path):
+            sys.exit("--kb-branch needs --branch and --kb-path")
+        return Kb(kind="branch", path=Path(args.kb_path).expanduser().resolve(), repo=args.kb_branch, branch=args.branch)
+    sys.exit("choose one of --kb-local <path>, --kb-branch <owner/repo> --branch <name> --kb-path <path>, or --no-kb")
+
+
+def cmd_new(args: argparse.Namespace) -> None:
+    slug = args.slug or slugify(args.name)
+    validate_new(args.name, args.icon, slug)
+    epics = tuple(parse_epic(value) for value in args.epic or [])
+    project = Project(slug=slug, name=args.name, icon=args.icon, epics=epics, kb=kb_from_args(args))
+    if project.kb:
+        create_kb(project, project.kb)
+    save_project(project)
+    print(f"created {project.icon} {project.name} [{slug}] in {project.file}")
+    if project.kb:
+        print(f"KB at {project.kb.describe()}")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    project = find_project(args.slug)
+    project.file.unlink()
+    print(f"removed {project.slug}; its KB (if any) was left in place")
+
+
+def cmd_epic_add(args: argparse.Namespace) -> None:
+    project = find_project(args.slug)
+    added = [url for url in (parse_epic(value) for value in args.urls) if epic_key(url) not in project.epic_keys]
+    save_project(dataclasses.replace(project, epics=project.epics + tuple(added)))
+    print(f"{project.name} epics: {', '.join(sorted(project.epic_keys | {epic_key(url) for url in added}))}")
+
+
+def cmd_epic_remove(args: argparse.Namespace) -> None:
+    project = find_project(args.slug)
+    removed = {epic_key(value) for value in args.keys}
+    kept = tuple(url for url in project.epics if epic_key(url) not in removed)
+    save_project(dataclasses.replace(project, epics=kept))
+    print(f"{project.name} epics: {', '.join(sorted(epic_key(url) for url in kept)) or 'none'}")
+
+
+def orca_worktree_at(path: Path) -> dict:
+    orca = orca_worktree(path)
+    if orca is None:
+        sys.exit(f"{path} is not inside an Orca-managed worktree")
+    return orca
+
+
+def repo_name(worktree: dict) -> str:
+    project_id = worktree.get("projectId") or ""
+    if project_id.startswith("github:"):
+        return project_id.split("/")[-1]
+    path = Path(worktree["path"])
+    origin = run(["git", "remote", "get-url", "origin"], cwd=path)
+    if origin.returncode == 0 and origin.stdout.strip():
+        return origin.stdout.strip().rstrip("/").split("/")[-1].removesuffix(".git")
+    common_dir = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path)
+    return Path(common_dir.stdout.strip()).parent.name
+
+
+def linked_pr(orca: dict) -> int | None:
+    prs = [ref["number"] for ref in orca.get("references", []) if ref.get("provider") == "github" and ref.get("type") == "pr"]
+    return prs[0] if len(prs) == 1 else None
+
+
+def display_name(project: Project, repo: str, pr: int | None, purpose: str | None, coordinator: bool) -> str:
+    name = project.name.upper() if coordinator else project.name
+    prefix = "▶ " if coordinator else ""
+    if pr:
+        return f"{prefix}{project.icon} {name} · {repo}#{pr}"
+    if purpose:
+        return f"{prefix}{project.icon} {name} · {repo} · {purpose}"
+    if coordinator:
+        return f"{prefix}{project.icon} {name} · {repo}"
+    sys.exit("no linked PR found; pass --purpose or --pr")
+
+
+def label_commands(project: Project, orca: dict, name: str | None) -> list[list[str]]:
+    selector = f"path:{orca['worktree']['path']}"
+    commands = []
+    if name:
+        commands.append(["orca", "worktree", "set", "--worktree", selector, "--display-name", name])
+    missing = [url for url in project.epics if epic_key(url) not in jira_keys(orca)]
+    if missing:
+        commands.append(["orca", "reference", "add", *missing, "--worktree", selector])
+    return commands
+
+
+def run_or_raise(command: list[str]) -> None:
+    result = run(command, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+
+def cmd_attach(args: argparse.Namespace) -> None:
+    project = find_project(args.slug)
+    orca = orca_worktree_at(Path(args.worktree).expanduser().resolve())
+    pr = args.pr or linked_pr(orca)
+    name = display_name(project, repo_name(orca["worktree"]), pr, args.purpose, args.coordinator)
+    for command in label_commands(project, orca, name):
+        print(shlex.join(command))
+        if not args.dry_run:
+            run_or_raise(command)
+    print("dry run, nothing changed" if args.dry_run else f"labelled as {name}")
+
+
+def worktree_command(payload: dict) -> str | None:
+    if payload.get("tool_name") != "Bash":
+        return None
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    return command if WORKTREE_COMMAND.search(command) else None
+
+
+def git_dirs(command: str, cwd: Path) -> set[Path]:
+    dirs = {cwd}
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return dirs
+    for flag, value in zip(tokens, tokens[1:]):
+        if flag == "-C":
+            dirs.add((cwd / Path(value).expanduser()).resolve())
+    return dirs
+
+
+def known_worktrees(command: str, cwd: Path) -> set[str]:
+    paths = set()
+    listing = run(["orca", "worktree", "list", "--json"], timeout=15) if shutil.which("orca") else None
+    if listing and listing.returncode == 0:
+        paths |= {os.path.realpath(w["path"]) for w in json.loads(listing.stdout)["result"]["worktrees"]}
+    for directory in git_dirs(command, cwd):
+        if not directory.is_dir():
+            continue
+        porcelain = run(["git", "worktree", "list", "--porcelain"], cwd=directory)
+        paths |= {os.path.realpath(line[len("worktree "):]) for line in porcelain.stdout.splitlines() if line.startswith("worktree ")}
+    return paths
+
+
+def snapshot_file(payload: dict) -> Path:
+    root = Path(os.environ.get("CLAUDE_PLUGIN_DATA") or tempfile.gettempdir()) / "project-kit-snapshots"
+    root.mkdir(parents=True, exist_ok=True)
+    key = f"{payload.get('session_id', 'session')}-{payload.get('tool_use_id', 'tool')}"
+    return root / f"{re.sub(r'[^A-Za-z0-9_-]', '_', key)}.json"
+
+
+def cmd_pre_tool(_: argparse.Namespace) -> None:
+    payload = hook_input()
+    command = worktree_command(payload)
+    cwd = hook_cwd(payload)
+    if command is None or detect(cwd) is None:
+        return
+    snapshot_file(payload).write_text(json.dumps(sorted(known_worktrees(command, cwd))))
+
+
+def wait_for_orca(path: Path) -> dict | None:
+    for _ in range(6):
+        orca = orca_worktree(path)
+        if orca is not None:
+            return orca
+        time.sleep(0.5)
+    return None
+
+
+def branch_purpose(worktree: dict) -> str:
+    branch = (worktree.get("branch") or "").removeprefix("refs/heads/")
+    return branch.split("/")[-1] if branch else Path(worktree["path"]).name
+
+
+def label_new_worktree(project: Project, path: Path) -> str:
+    orca = wait_for_orca(path)
+    if orca is None:
+        return f"{path}: not managed by Orca, so not labelled. Run `/project attach {project.slug}` there once Orca lists it."
+    worktree = orca["worktree"]
+    current_name = worktree.get("displayName") or ""
+    is_labelled = any(current_name.lstrip("▶ ").startswith(other.icon) for other in load_projects())
+    name = None
+    if not is_labelled:
+        name = display_name(project, repo_name(worktree), linked_pr(orca), branch_purpose(worktree), False)
+    for command in label_commands(project, orca, name):
+        run_or_raise(command)
+    if name:
+        return f"{path}: labelled `{name}` with the {project.name} epics. Rename it with a better purpose if the branch name is not one."
+    return f"{path}: kept its name `{worktree['displayName']}` and attached the {project.name} epics. It was already labelled."
+
+
+def cmd_post_tool(_: argparse.Namespace) -> None:
+    payload = hook_input()
+    command = worktree_command(payload)
+    if command is None:
+        return
+    snapshot = snapshot_file(payload)
+    if not snapshot.exists():
+        return
+    before = set(json.loads(snapshot.read_text()))
+    snapshot.unlink()
+    cwd = hook_cwd(payload)
+    match = detect(cwd)
+    if match is None:
+        return
+    new_paths = sorted(known_worktrees(command, cwd) - before)
+    if not new_paths:
+        return
+    notes = []
+    for path in new_paths:
+        try:
+            notes.append(label_new_worktree(match[0], Path(path)))
+        except Exception as error:
+            notes.append(f"{path}: labelling failed: {error}. Run `/project attach {match[0].slug}` there.")
+    context = "project-kit labelled the new worktree(s) for this session's project:\n" + "\n".join(f"- {note}" for note in notes)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}, ensure_ascii=False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="project-kit")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("session-start", help="SessionStart hook").set_defaults(func=cmd_session_start)
+    sub.add_parser("stop", help="Stop hook").set_defaults(func=cmd_stop)
+    sub.add_parser("pre-tool", help="PreToolUse hook: snapshot worktrees").set_defaults(func=cmd_pre_tool)
+    sub.add_parser("post-tool", help="PostToolUse hook: label new worktrees").set_defaults(func=cmd_post_tool)
+    sub.add_parser("list", help="list projects").set_defaults(func=cmd_list)
+    detect_parser = sub.add_parser("detect", help="show which project a directory belongs to")
+    detect_parser.add_argument("path", nargs="?", default=os.getcwd())
+    detect_parser.set_defaults(func=cmd_detect)
+    new = sub.add_parser("new", help="register a project and create its KB")
+    new.add_argument("--name", required=True)
+    new.add_argument("--icon", required=True)
+    new.add_argument("--slug")
+    new.add_argument("--epic", action="append", metavar="URL")
+    new.add_argument("--kb-local", metavar="PATH")
+    new.add_argument("--kb-branch", metavar="OWNER/REPO")
+    new.add_argument("--branch", metavar="NAME")
+    new.add_argument("--kb-path", metavar="PATH")
+    new.add_argument("--no-kb", action="store_true")
+    new.set_defaults(func=cmd_new)
+    remove = sub.add_parser("remove", help="remove a project from the registry")
+    remove.add_argument("slug")
+    remove.set_defaults(func=cmd_remove)
+    epic = sub.add_parser("epic", help="add or remove a project's Jira epics").add_subparsers(dest="epic_command", required=True)
+    epic_add = epic.add_parser("add", help="add epics by full Jira link")
+    epic_add.add_argument("slug")
+    epic_add.add_argument("urls", nargs="+", metavar="URL")
+    epic_add.set_defaults(func=cmd_epic_add)
+    epic_remove = epic.add_parser("remove", help="remove epics by key or link")
+    epic_remove.add_argument("slug")
+    epic_remove.add_argument("keys", nargs="+", metavar="KEY_OR_URL")
+    epic_remove.set_defaults(func=cmd_epic_remove)
+    attach = sub.add_parser("attach", help="label an Orca worktree with a project")
+    attach.add_argument("slug")
+    attach.add_argument("--worktree", default=os.getcwd(), metavar="PATH")
+    attach.add_argument("--purpose")
+    attach.add_argument("--pr", type=int)
+    attach.add_argument("--coordinator", action="store_true")
+    attach.add_argument("--dry-run", action="store_true")
+    attach.set_defaults(func=cmd_attach)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except Exception as error:
+        if args.command in ("session-start", "stop", "pre-tool", "post-tool"):
+            print(json.dumps({"systemMessage": f"project-kit {args.command} hook failed: {error}"}))
+            return
+        raise
+
+
+if __name__ == "__main__":
+    main()
