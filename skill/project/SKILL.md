@@ -27,15 +27,14 @@ Then run one of:
 
 ```
 project-kit new --name "<Name>" --icon <emoji> --epic https://<site>/browse/<KEY> \
-  --kb-branch <owner>/<repo> --branch kb-<slug> --kb-path <path>
+  --kb-branch <owner>/<repo> --branch kb-<slug>
 project-kit new --name "<Name>" --icon <emoji> --epic https://<site>/browse/<KEY> --kb-local <path>
 project-kit new --name "<Name>" --icon <emoji> --no-kb
 ```
 
 A branch KB pushes a new orphan branch to the remote. Say so and get an explicit yes first.
-The KB path is a standalone clone outside every repo, never a git or Orca worktree, so Orca never
-lists it. To move an existing worktree KB: commit and push it, remove the worktree, set the
-project's `kb.path`, and let the next session clone it.
+project-kit keeps a branch KB's clone in `~/.local/share/project-kit/kb/<slug>`, out of the code
+folders and out of Orca. Never check a KB out as a git or Orca worktree.
 Report the project file and the KB path. Then offer `/project attach <slug>` for the current
 worktree.
 

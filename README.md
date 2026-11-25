@@ -65,18 +65,17 @@ A project file:
   "kb": {
     "kind": "branch",
     "repo": "acme/web",
-    "branch": "kb-launch",
-    "path": "~/dev/kb-launch"
+    "branch": "kb-launch"
   }
 }
 ```
 
 `kb` can also be `{ "kind": "local", "path": "..." }` or `null`.
 
-A branch KB is always its own clone of that one branch, outside every repo's worktrees. Never
-check it out with `git worktree add` or `orca worktree create`: Orca would list it as a worktree
-of the repo, and you never work in a KB from Orca. project-kit clones it for you; it stops pulling
-a KB that is a worktree and says how to fix it.
+A branch KB is a clone of that one branch that project-kit keeps in
+`~/.local/share/project-kit/kb/<slug>` (under `$XDG_DATA_HOME` if set), out of your code folders
+and out of Orca. You never open it yourself: sessions get its path, read it and push to it. Never
+check a KB out with `git worktree add` or `orca worktree create`, since Orca would list it.
 
 ## Use
 
