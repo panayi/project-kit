@@ -180,6 +180,11 @@ def pull_kb(kb: Kb) -> str:
     if not kb.path.exists():
         error = clone_kb(kb)
         return f"clone failed: {error}" if error else "cloned fresh"
+    if (kb.path / ".git").is_file():
+        return (
+            f"not pulled: {kb.path} is a git worktree of another checkout, so Orca lists it. "
+            "Commit and push it, remove the worktree, and the next session clones it on its own"
+        )
     try:
         result = run(["git", "pull", "--rebase"], cwd=kb.path, timeout=30)
     except subprocess.TimeoutExpired:
