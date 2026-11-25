@@ -46,14 +46,14 @@ stay in `~/.config/project-kit`.
 
 ## Where things live
 
-| Path                                   | What                                                   |
-| -------------------------------------- | ------------------------------------------------------ |
-| `~/.config/project-kit/projects/*.json` | Your projects. Set `PROJECT_KIT_HOME` to move them.    |
-| `plugin/bin/project-kit`               | The CLI, on PATH in every session.                     |
-| `plugin/hooks/hooks.json`              | The SessionStart, Stop and worktree-labelling hooks.   |
-| `skill/project/`                       | The `/project` skill.                                  |
-| `rules/`                               | The Orca naming rule, injected into every session.     |
-| `kb-template/`                         | What a new KB starts from.                             |
+| Path                                    | What                                                 |
+| --------------------------------------- | ---------------------------------------------------- |
+| `~/.config/project-kit/projects/*.json` | Your projects. Set `PROJECT_KIT_HOME` to move them.  |
+| `plugin/bin/project-kit`                | The CLI, on PATH in every session.                   |
+| `plugin/hooks/hooks.json`               | The SessionStart, Stop and worktree-labelling hooks. |
+| `skill/project/`                        | The `/project` skill.                                |
+| `rules/`                                | The Orca naming rule, injected into every session.   |
+| `kb-template/`                          | What a new KB starts from.                           |
 
 A project file:
 
@@ -62,11 +62,21 @@ A project file:
   "name": "Launch",
   "icon": "🚀",
   "epics": ["https://example.atlassian.net/browse/ABC-123"],
-  "kb": { "kind": "branch", "repo": "acme/web", "branch": "kb-launch", "path": "~/dev/kb-launch" }
+  "kb": {
+    "kind": "branch",
+    "repo": "acme/web",
+    "branch": "kb-launch",
+    "path": "~/dev/kb-launch"
+  }
 }
 ```
 
 `kb` can also be `{ "kind": "local", "path": "..." }` or `null`.
+
+A branch KB is always its own clone of that one branch, outside every repo's worktrees. Never
+check it out with `git worktree add` or `orca worktree create`: Orca would list it as a worktree
+of the repo, and you never work in a KB from Orca. project-kit clones it for you; it stops pulling
+a KB that is a worktree and says how to fix it.
 
 ## Use
 

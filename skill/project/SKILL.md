@@ -33,6 +33,9 @@ project-kit new --name "<Name>" --icon <emoji> --no-kb
 ```
 
 A branch KB pushes a new orphan branch to the remote. Say so and get an explicit yes first.
+The KB path is a standalone clone outside every repo, never a git or Orca worktree, so Orca never
+lists it. To move an existing worktree KB: commit and push it, remove the worktree, set the
+project's `kb.path`, and let the next session clone it.
 Report the project file and the KB path. Then offer `/project attach <slug>` for the current
 worktree.
 
