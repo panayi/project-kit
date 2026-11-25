@@ -20,5 +20,5 @@ project session automatically. To label one by hand, run `/project attach <slug>
 - The project's epics are attached as full Jira links, so `orca reference find <KEY>` lists the
   worktree.
 - Never move an existing worktree to tidy up: Claude sessions and Orca chats are tied to its path.
-- A project's KB is never an Orca or git worktree. It is its own clone, which project-kit makes,
-  and Orca doesn't list it.
+- A project's KB is never an Orca or git worktree. project-kit keeps its clone in
+  `~/.local/share/project-kit/kb/<slug>`, out of the code folders and out of Orca.

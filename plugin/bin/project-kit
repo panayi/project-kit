@@ -22,6 +22,7 @@ TEMPLATE_DIR = ROOT / "kb-template"
 RULES_DIR = ROOT / "rules"
 CONFIG_HOME = Path(os.environ.get("PROJECT_KIT_HOME") or "~/.config/project-kit").expanduser()
 PROJECTS_DIR = CONFIG_HOME / "projects"
+KB_HOME = Path(os.environ.get("XDG_DATA_HOME") or "~/.local/share").expanduser() / "project-kit" / "kb"
 EPIC_URL = re.compile(r"https://[^\s/]+/browse/([A-Z][A-Z0-9]*-\d+)")
 STATE_INLINE_LIMIT = 8000
 STATE_PREVIEW_LIMIT = 6000
@@ -73,15 +74,12 @@ def parse_epic(value: str) -> str:
     return match.group(0)
 
 
-def parse_kb(raw: dict | None) -> Kb | None:
+def parse_kb(raw: dict | None, slug: str) -> Kb | None:
     if raw is None:
         return None
-    return Kb(
-        kind=raw["kind"],
-        path=Path(raw["path"]).expanduser(),
-        repo=raw.get("repo"),
-        branch=raw.get("branch"),
-    )
+    if raw["kind"] == "branch":
+        return Kb(kind="branch", path=KB_HOME / slug, repo=raw["repo"], branch=raw["branch"])
+    return Kb(kind="local", path=Path(raw["path"]).expanduser())
 
 
 def load_projects() -> list[Project]:
@@ -96,7 +94,7 @@ def load_projects() -> list[Project]:
                 name=raw["name"],
                 icon=raw["icon"],
                 epics=tuple(raw.get("epics", [])),
-                kb=parse_kb(raw.get("kb")),
+                kb=parse_kb(raw.get("kb"), file.stem),
             )
         )
     return projects
@@ -382,31 +380,32 @@ def create_kb(project: Project, kb: Kb) -> None:
 def save_project(project: Project) -> None:
     kb = None
     if project.kb:
-        kb = {"kind": project.kb.kind, "path": str(project.kb.path).replace(str(Path.home()), "~", 1)}
         if project.kb.kind == "branch":
-            kb.update(repo=project.kb.repo, branch=project.kb.branch)
+            kb = {"kind": "branch", "repo": project.kb.repo, "branch": project.kb.branch}
+        else:
+            kb = {"kind": "local", "path": str(project.kb.path).replace(str(Path.home()), "~", 1)}
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     raw = {"name": project.name, "icon": project.icon, "epics": list(project.epics), "kb": kb}
     project.file.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
 
 
-def kb_from_args(args: argparse.Namespace) -> Kb | None:
+def kb_from_args(args: argparse.Namespace, slug: str) -> Kb | None:
     if args.no_kb:
         return None
     if args.kb_local:
         return Kb(kind="local", path=Path(args.kb_local).expanduser().resolve())
     if args.kb_branch:
-        if not (args.branch and args.kb_path):
-            sys.exit("--kb-branch needs --branch and --kb-path")
-        return Kb(kind="branch", path=Path(args.kb_path).expanduser().resolve(), repo=args.kb_branch, branch=args.branch)
-    sys.exit("choose one of --kb-local <path>, --kb-branch <owner/repo> --branch <name> --kb-path <path>, or --no-kb")
+        if not args.branch:
+            sys.exit("--kb-branch needs --branch")
+        return Kb(kind="branch", path=KB_HOME / slug, repo=args.kb_branch, branch=args.branch)
+    sys.exit("choose one of --kb-local <path>, --kb-branch <owner/repo> --branch <name>, or --no-kb")
 
 
 def cmd_new(args: argparse.Namespace) -> None:
     slug = args.slug or slugify(args.name)
     validate_new(args.name, args.icon, slug)
     epics = tuple(parse_epic(value) for value in args.epic or [])
-    project = Project(slug=slug, name=args.name, icon=args.icon, epics=epics, kb=kb_from_args(args))
+    project = Project(slug=slug, name=args.name, icon=args.icon, epics=epics, kb=kb_from_args(args, slug))
     if project.kb:
         create_kb(project, project.kb)
     save_project(project)
@@ -626,7 +625,6 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--kb-local", metavar="PATH")
     new.add_argument("--kb-branch", metavar="OWNER/REPO")
     new.add_argument("--branch", metavar="NAME")
-    new.add_argument("--kb-path", metavar="PATH")
     new.add_argument("--no-kb", action="store_true")
     new.set_defaults(func=cmd_new)
     remove = sub.add_parser("remove", help="remove a project from the registry")
